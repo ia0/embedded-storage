@@ -1,5 +1,127 @@
 use crate::{iter::IterableByOverlaps, ReadStorage, Region, Storage};
 
+/// Input bytes for read operation.
+pub struct Bytes<'i, 'o> {
+	input: &'i mut [u8],
+	output: Option<&'o [u8]>,
+}
+
+impl<'i, 'o> Bytes<'i, 'o> {
+	/// Prevents Drop to copy the content.
+	pub fn no_copy(mut self) {
+		self.output = None;
+	}
+}
+
+impl<'i, 'o> core::ops::Deref for Bytes<'i, 'o> {
+	type Target = [u8];
+
+	fn deref<'a>(&'a self) -> &'a [u8] {
+		match self.output {
+			None => self.input,
+			Some(x) => x,
+		}
+	}
+}
+
+impl<'i, 'o> From<&'i mut [u8]> for Bytes<'i, 'o> {
+	fn from(input: &'i mut [u8]) -> Bytes<'i, 'o> {
+		Bytes {
+			input,
+			output: None,
+		}
+	}
+}
+
+impl<'i, 'o> Drop for Bytes<'i, 'o> {
+	fn drop(&mut self) {
+		if let Some(output) = self.output {
+			self.input.copy_from_slice(output);
+		}
+	}
+}
+
+#[test]
+fn bytes_size() {
+	assert_eq!(
+		core::mem::size_of::<Bytes>(),
+		2 * core::mem::size_of::<&mut [u8]>()
+	);
+}
+
+#[test]
+fn bytes_usage() {
+	struct Flash<const N: usize> {
+		storage: [u8; N],
+	}
+	const DIRECT: u32 = 0;
+	const COPY: u32 = 1;
+	impl<const N: usize> ReadNorFlash for Flash<N> {
+		type Error = ();
+		const READ_SIZE: usize = 1;
+		fn read<'i, 'o>(
+			&'o self,
+			mode: u32,
+			bytes: impl Into<Bytes<'i, 'o>>,
+		) -> Result<Bytes<'i, 'o>, ()> {
+			let mut bytes = bytes.into();
+			if bytes.len() > N {
+				return Err(());
+			}
+			match mode {
+				DIRECT => bytes.output = Some(&self.storage[..bytes.len()]),
+				COPY => bytes.input.copy_from_slice(&self.storage[..bytes.len()]),
+				_ => unreachable!(),
+			}
+			Ok(bytes)
+		}
+		fn capacity(&self) -> usize {
+			N
+		}
+	}
+
+	const N: usize = 3;
+	let storage = [0x53; N];
+	let flash = Flash { storage };
+
+	// Direct read and drop: copy to buffer.
+	let mut buffer = [0; N];
+	flash.read(DIRECT, &mut buffer[..]).unwrap();
+	assert_eq!(buffer, storage);
+
+	// Direct read and keep: no copy.
+	let mut buffer = [0; N];
+	let result = flash.read(DIRECT, &mut buffer[..]).unwrap();
+	assert_eq!(*result, storage);
+	result.no_copy();
+	assert_eq!(buffer, [0; N]);
+
+	// Copy read.
+	let mut buffer = [0; N];
+	flash.read(COPY, &mut buffer[..]).unwrap();
+	assert_eq!(buffer, storage);
+
+	// Multiple copy read.
+	let mut buffer_a = [0; N];
+	let mut buffer_b = [0; N];
+	flash.read(COPY, &mut buffer_a[..]).unwrap();
+	flash.read(COPY, &mut buffer_b[..]).unwrap();
+	assert_eq!(buffer_a, storage);
+	assert_eq!(buffer_b, storage);
+
+	// Multiple direct read: requires read(&self) instead of read(&mut self).
+	let mut buffer_a = [0; N];
+	let mut buffer_b = [0; N];
+	let result_a = flash.read(DIRECT, &mut buffer_a[..]).unwrap();
+	let result_b = flash.read(DIRECT, &mut buffer_b[..]).unwrap();
+	assert_eq!(*result_a, storage);
+	assert_eq!(*result_b, storage);
+	result_a.no_copy();
+	result_b.no_copy();
+	assert_eq!(buffer_a, [0; N]);
+	assert_eq!(buffer_b, [0; N]);
+}
+
 /// Read only NOR flash trait.
 pub trait ReadNorFlash {
 	/// An enumeration of storage errors
@@ -13,7 +135,11 @@ pub trait ReadNorFlash {
 	///
 	/// This should throw an error in case `bytes.len()` will be larger than
 	/// the peripheral end address.
-	fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error>;
+	fn read<'i, 'o>(
+		&'o self,
+		offset: u32,
+		bytes: impl Into<Bytes<'i, 'o>>,
+	) -> Result<Bytes<'i, 'o>, Self::Error>;
 
 	/// The capacity of the peripheral in bytes.
 	fn capacity(&self) -> usize;
@@ -115,7 +241,8 @@ where
 
 	fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
 		// Nothing special to be done for reads
-		self.storage.read(offset, bytes)
+		self.storage.read(offset, bytes)?;
+		Ok(())
 	}
 
 	fn capacity(&self) -> usize {
@@ -190,7 +317,8 @@ where
 
 	fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
 		// Nothing special to be done for reads
-		self.storage.read(offset, bytes)
+		self.storage.read(offset, bytes)?;
+		Ok(())
 	}
 
 	fn capacity(&self) -> usize {
